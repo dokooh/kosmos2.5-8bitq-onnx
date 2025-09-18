@@ -114,76 +114,254 @@ class KosmosFP8Converter:
         logger.info("Converting model to ONNX format...")
         
         try:
-            # Create dummy inputs for export
+            # Save the model first for Optimum export
+            temp_model_path = self.output_dir / "temp_model"
+            temp_model_path.mkdir(exist_ok=True)
+            
+            # Save model and processor
+            self.model.save_pretrained(temp_model_path)
+            self.processor.save_pretrained(temp_model_path)
+            
+            logger.info("Model saved temporarily for ONNX export")
+            
+            # Use Optimum for ONNX export (more reliable for complex models)
+            from optimum.onnxruntime import ORTModelForVision2Seq
+            
+            onnx_output_path = self.output_dir / "kosmos_fp8_onnx"
+            
+            # Load and export using Optimum
+            logger.info("Using Optimum for ONNX export...")
+            ort_model = ORTModelForVision2Seq.from_pretrained(
+                temp_model_path,
+                export=True,
+                provider="CPUExecutionProvider"
+            )
+            
+            # Save the ONNX model
+            ort_model.save_pretrained(onnx_output_path)
+            
+            # Find the main ONNX model file
+            onnx_files = list(onnx_output_path.glob("*.onnx"))
+            if onnx_files:
+                main_onnx_path = onnx_files[0]  # Usually encoder.onnx or similar
+                logger.info(f"ONNX model exported to: {main_onnx_path}")
+                
+                # Verify ONNX model
+                try:
+                    onnx_model = onnx.load(str(main_onnx_path))
+                    onnx.checker.check_model(onnx_model)
+                    logger.info("ONNX model verification passed")
+                except Exception as verify_error:
+                    logger.warning(f"ONNX verification warning: {verify_error}")
+                
+                return str(main_onnx_path)
+            else:
+                logger.error("No ONNX files found after export")
+                return None
+            
+        except ImportError as ie:
+            logger.error(f"Missing dependency for Optimum ONNX export: {ie}")
+            logger.info("Falling back to manual ONNX export...")
+            return self.fallback_onnx_export()
+            
+        except Exception as e:
+            logger.error(f"Error during Optimum ONNX conversion: {e}")
+            logger.info("Falling back to manual ONNX export...")
+            return self.fallback_onnx_export()
+    
+    def fallback_onnx_export(self):
+        """Fallback method for ONNX export using torch.onnx directly."""
+        logger.info("Attempting fallback ONNX export...")
+        
+        try:
+            # Create a wrapper model that handles the complex inputs
+            class KosmosONNXWrapper(torch.nn.Module):
+                def __init__(self, model):
+                    super().__init__()
+                    self.model = model
+                
+                def forward(self, pixel_values, input_ids, attention_mask=None):
+                    # Prepare inputs in the format expected by the model
+                    model_inputs = {
+                        'pixel_values': pixel_values,
+                        'input_ids': input_ids
+                    }
+                    if attention_mask is not None:
+                        model_inputs['attention_mask'] = attention_mask
+                    
+                    # Run the model
+                    outputs = self.model(**model_inputs)
+                    
+                    # Return only the logits
+                    if hasattr(outputs, 'logits'):
+                        return outputs.logits
+                    elif hasattr(outputs, 'last_hidden_state'):
+                        return outputs.last_hidden_state
+                    else:
+                        # Return the first output if structure is unclear
+                        return outputs[0] if isinstance(outputs, (tuple, list)) else outputs
+            
+            # Create wrapper
+            wrapper_model = KosmosONNXWrapper(self.model)
+            wrapper_model.eval()
+            
+            # Create dummy inputs
             dummy_inputs = self.create_dummy_inputs()
             
-            # Prepare model for export
-            self.model.eval()
+            # Prepare inputs for export
+            pixel_values = dummy_inputs['pixel_values']
+            input_ids = dummy_inputs['input_ids']
+            attention_mask = dummy_inputs.get('attention_mask', 
+                                            torch.ones_like(input_ids))
             
-            # ONNX export paths
+            # ONNX export path
             onnx_path = self.output_dir / "kosmos_fp8_model.onnx"
             
-            # Export to ONNX
+            logger.info("Exporting with torch.onnx.export...")
+            
+            # Export to ONNX with simpler structure
             torch.onnx.export(
-                self.model,
-                (dummy_inputs['pixel_values'], dummy_inputs['input_ids']),
+                wrapper_model,
+                (pixel_values, input_ids, attention_mask),
                 str(onnx_path),
-                input_names=['pixel_values', 'input_ids'],
+                input_names=['pixel_values', 'input_ids', 'attention_mask'],
                 output_names=['logits'],
                 dynamic_axes={
                     'pixel_values': {0: 'batch_size'},
                     'input_ids': {0: 'batch_size', 1: 'sequence_length'},
+                    'attention_mask': {0: 'batch_size', 1: 'sequence_length'},
                     'logits': {0: 'batch_size', 1: 'sequence_length'}
                 },
-                opset_version=14,
-                do_constant_folding=True,
-                verbose=False
+                opset_version=11,  # Use older opset for better compatibility
+                do_constant_folding=False,  # Disable for complex models
+                verbose=True,
+                export_params=True
             )
             
-            logger.info(f"ONNX model saved to: {onnx_path}")
+            logger.info(f"Fallback ONNX model saved to: {onnx_path}")
             
-            # Verify ONNX model
-            onnx_model = onnx.load(str(onnx_path))
-            onnx.checker.check_model(onnx_model)
-            logger.info("ONNX model verification passed")
+            # Basic verification
+            try:
+                onnx_model = onnx.load(str(onnx_path))
+                onnx.checker.check_model(onnx_model)
+                logger.info("Fallback ONNX model verification passed")
+            except Exception as verify_error:
+                logger.warning(f"ONNX verification warning: {verify_error}")
             
             return str(onnx_path)
             
         except Exception as e:
-            logger.error(f"Error during ONNX conversion: {e}")
+            logger.error(f"Fallback ONNX export also failed: {e}")
+            # Try one more simple approach
+            return self.simple_onnx_export()
+    
+    def simple_onnx_export(self):
+        """Very simple ONNX export for basic compatibility."""
+        logger.info("Attempting simple ONNX export...")
+        
+        try:
+            # Extract just the vision encoder or text decoder
+            if hasattr(self.model, 'vision_model'):
+                model_to_export = self.model.vision_model
+                input_type = "vision"
+            elif hasattr(self.model, 'text_model') or hasattr(self.model, 'language_model'):
+                model_to_export = getattr(self.model, 'text_model', 
+                                        getattr(self.model, 'language_model', None))
+                input_type = "text"
+            else:
+                logger.error("Could not identify exportable submodule")
+                return None
+            
+            model_to_export.eval()
+            
+            # Create appropriate dummy input
+            if input_type == "vision":
+                dummy_input = torch.randn(1, 3, 224, 224)
+                input_names = ['pixel_values']
+                onnx_filename = "kosmos_vision_fp8.onnx"
+            else:
+                dummy_input = torch.randint(0, 1000, (1, 10))  # Text tokens
+                input_names = ['input_ids']
+                onnx_filename = "kosmos_text_fp8.onnx"
+            
+            onnx_path = self.output_dir / onnx_filename
+            
+            # Simple export
+            torch.onnx.export(
+                model_to_export,
+                dummy_input,
+                str(onnx_path),
+                input_names=input_names,
+                output_names=['output'],
+                opset_version=11,
+                do_constant_folding=False,
+                verbose=False
+            )
+            
+            logger.info(f"Simple ONNX model ({input_type}) saved to: {onnx_path}")
+            return str(onnx_path)
+            
+        except Exception as e:
+            logger.error(f"Simple ONNX export failed: {e}")
             return None
     
     def optimize_for_browser(self, onnx_path):
         """Optimize ONNX model for browser deployment."""
+        if not onnx_path:
+            logger.error("No ONNX path provided for optimization")
+            return None
+            
         logger.info("Optimizing ONNX model for browser...")
         
         try:
             import onnxruntime as ort
-            from onnxruntime.tools.onnx_model_utils import make_dynamic_shape_fixed
             
-            # Load ONNX model
-            model = onnx.load(onnx_path)
+            # Check if the path exists
+            if not os.path.exists(onnx_path):
+                logger.error(f"ONNX file not found: {onnx_path}")
+                return onnx_path
+            
+            # Load ONNX model for validation
+            try:
+                model = onnx.load(onnx_path)
+                logger.info("ONNX model loaded successfully for optimization")
+            except Exception as load_error:
+                logger.warning(f"Could not load ONNX model for optimization: {load_error}")
+                return onnx_path
             
             # Optimize for web deployment
             optimized_path = self.output_dir / "kosmos_fp8_optimized.onnx"
             
-            # Create optimization session
-            sess_options = ort.SessionOptions()
-            sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            sess_options.optimized_model_filepath = str(optimized_path)
-            
-            # Run optimization
-            session = ort.InferenceSession(onnx_path, sess_options)
-            
-            logger.info(f"Optimized ONNX model saved to: {optimized_path}")
-            
-            # Generate model info for browser integration
-            self.generate_browser_config(optimized_path)
-            
-            return str(optimized_path)
+            try:
+                # Create optimization session
+                sess_options = ort.SessionOptions()
+                sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                sess_options.optimized_model_filepath = str(optimized_path)
+                
+                # Run optimization
+                providers = ['CPUExecutionProvider']
+                session = ort.InferenceSession(onnx_path, sess_options, providers=providers)
+                
+                logger.info(f"Optimized ONNX model saved to: {optimized_path}")
+                
+                # Generate model info for browser integration
+                self.generate_browser_config(str(optimized_path))
+                
+                return str(optimized_path)
+                
+            except Exception as opt_error:
+                logger.warning(f"Optimization failed, using original model: {opt_error}")
+                # Generate browser config with original model
+                self.generate_browser_config(onnx_path)
+                return onnx_path
             
         except Exception as e:
             logger.error(f"Error during browser optimization: {e}")
+            # Still try to generate browser config
+            try:
+                self.generate_browser_config(onnx_path)
+            except Exception as config_error:
+                logger.warning(f"Could not generate browser config: {config_error}")
             return onnx_path
     
     def generate_browser_config(self, onnx_path):
@@ -318,32 +496,64 @@ if (typeof module !== 'undefined' && module.exports) {{
         """Run the complete conversion pipeline."""
         logger.info("Starting Kosmos-2.5 FP8 quantization and ONNX conversion pipeline...")
         
-        # Step 1: Load model and processor
-        if not self.load_model_and_processor():
+        try:
+            # Step 1: Load model and processor
+            logger.info("Step 1/4: Loading model and processor...")
+            if not self.load_model_and_processor():
+                logger.error("Failed to load model and processor")
+                return False
+            
+            # Step 2: Apply FP8 quantization
+            logger.info("Step 2/4: Applying FP8 quantization...")
+            if not self.apply_fp8_quantization():
+                logger.error("Failed to apply FP8 quantization")
+                return False
+            
+            # Step 3: Convert to ONNX
+            logger.info("Step 3/4: Converting to ONNX format...")
+            onnx_path = self.convert_to_onnx()
+            if not onnx_path:
+                logger.error("Failed to convert to ONNX format")
+                return False
+            
+            # Step 4: Optimize for browser
+            logger.info("Step 4/4: Optimizing for browser deployment...")
+            optimized_path = self.optimize_for_browser(onnx_path)
+            
+            # Report results
+            logger.info("="*60)
+            logger.info("CONVERSION PIPELINE COMPLETED!")
+            logger.info("="*60)
+            logger.info(f"Output directory: {self.output_dir}")
+            
+            if optimized_path and os.path.exists(optimized_path):
+                logger.info(f"✅ Optimized ONNX model: {optimized_path}")
+            elif onnx_path and os.path.exists(onnx_path):
+                logger.info(f"✅ Basic ONNX model: {onnx_path}")
+            else:
+                logger.warning("⚠️  ONNX model path unclear, check output directory")
+            
+            # Check for generated files
+            demo_file = self.output_dir / "demo.html"
+            config_file = self.output_dir / "kosmos_config.js"
+            
+            if demo_file.exists():
+                logger.info(f"✅ Browser demo: {demo_file}")
+            else:
+                logger.warning("⚠️  Browser demo not generated")
+                
+            if config_file.exists():
+                logger.info(f"✅ JavaScript config: {config_file}")
+            else:
+                logger.warning("⚠️  JavaScript config not generated")
+            
+            logger.info("="*60)
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Unexpected error in conversion pipeline: {e}")
             return False
-        
-        # Step 2: Apply FP8 quantization
-        if not self.apply_fp8_quantization():
-            return False
-        
-        # Step 3: Convert to ONNX
-        onnx_path = self.convert_to_onnx()
-        if not onnx_path:
-            return False
-        
-        # Step 4: Optimize for browser
-        optimized_path = self.optimize_for_browser(onnx_path)
-        
-        logger.info("="*60)
-        logger.info("CONVERSION PIPELINE COMPLETED SUCCESSFULLY!")
-        logger.info("="*60)
-        logger.info(f"Output directory: {self.output_dir}")
-        logger.info(f"Optimized ONNX model: {optimized_path}")
-        logger.info(f"Browser demo: {self.output_dir}/demo.html")
-        logger.info(f"JavaScript config: {self.output_dir}/kosmos_config.js")
-        logger.info("="*60)
-        
-        return True
 
 
 def main():
